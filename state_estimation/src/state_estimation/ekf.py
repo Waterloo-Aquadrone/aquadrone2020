@@ -1,5 +1,7 @@
 import rospy
 import scipy.linalg
+import rospkg
+import json
 
 import numpy as np
 import sympy as sp
@@ -95,6 +97,8 @@ class EKF:
         self.depth_sub.initialize()
         self.imu_sub.initialize()
         self.vision_sensor_manager.initialize()
+        self.isMapLoaded = False
+        self.mapRotationMatrix = []
 
     def initialize_state(self, msg=None):
         self.x = np.zeros(self.n + self.p)
@@ -123,20 +127,21 @@ class EKF:
         """
         # extract data from sensors into lists
         listeners = [self.depth_sub, self.imu_sub] + self.vision_sensor_manager.get_listeners()
+
+        if np.sum([listener.is_valid() for listener in listeners]) == 0:
+            return # no valid measurements
+
         z, h, h_jacobian, R = zip(*[(listener.get_measurement_z(),
                                      listener.state_to_measurement_h(self.x, self.u),
                                      listener.get_h_jacobian(self.x, self.u),
                                      listener.get_R())
                                     for listener in listeners if listener.is_valid()])
         # package lists into arrays/matrices as appropriate
+
         z = np.concatenate(z)  # measurements
         h = np.concatenate(h)  # predicted measurements
         h_jacobian = np.vstack(h_jacobian)  # Jacobian of function h
         R = scipy.linalg.block_diag(*R)  # Uncertainty matrix of measurement, note: this doesn't need to be sympy-able
-
-        if len(z) == 0:
-            # no valid measurements
-            return
 
         # Error in measurements vs predicted
         y = z - h
@@ -154,7 +159,31 @@ class EKF:
 
         # Update state x and uncertainty P
         self.x += np.dot(K, y)  # increase by error in measurement vs predicted, scaled by Kalman gain
-        self.P -= np.linalg.multi_dot([K, h_jacobian, self.P])  # decrease, scaled by Kalman gain
+        self.P = self.P - np.linalg.multi_dot([K, h_jacobian, self.P]).astype('float64')  # decrease, scaled by Kalman gain
+
+        rospack = rospkg.RosPack()
+        if not self.isMapLoaded:
+            for listener_index in range(len(listeners)-2):
+                if self.P[listener_index][listener_index] < self.MAX_VARIANCE:
+                    with open(rospack.get_path('state_estimation') + "/src/state_estimation/landmarks.json") as lm_file:
+                        landmarks = json.load(lm_file)
+                        landmarksA = landmarks["landmarks_A"]
+                        actual_location = z[self.n+listener_index: self.n+listener_index+2]
+                        expected_location = landmarksA[listener_index]["location"][:2]
+                        actual_location_unit = actual_location / np.linalg.norm(actual_location)
+                        expected_location_unit = expected_location / np.linalg.norm(expected_location)
+                        x_a, y_a = expected_location_unit
+                        x_b, y_b = actual_location_unit
+                        self.mapRotationMatrix = np.array([[x_a*x_b+y_a*y_b, x_b*y_a-x_a*y_b], [x_a*y_b-x_b*y_a, x_a*x_b+y_a*y_b]])
+
+                        for landmark_index in range(len(landmarksA)):
+                            start_index = self.n + landmark_index
+                            exp_location = landmarksA[landmark_index]["location"]
+                            rotated_location = np.concatenate((np.dot(self.mapRotationMatrix, exp_location[:2]), exp_location[2:3]))
+                            self.x[start_index: start_index + 3] = rotated_location
+                            self.P[start_index][start_index] = 3
+                        self.isMapLoaded = True
+
 
     def f(self, x, u, dt):
         """
